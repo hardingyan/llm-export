@@ -1857,7 +1857,7 @@ class Rotary(torch.nn.Module):
         return torch.cat((x1, x2), dim=-1)
 
 class Decoder(torch.nn.Module):
-    def __init__(self, decoder, layer_id, config):
+    def __init__(self, decoder, layer_id, config, rotary):
         super().__init__()
         self.cross_decoder = False
         ModelMapper.do_map(self, decoder, config.model_map['decoder'])
@@ -1870,6 +1870,7 @@ class Decoder(torch.nn.Module):
         self.hidden_size = config.hidden_size
         # chatglm
         self.alpha = (2 * config.num_hidden_layers) ** 0.5 if config.model_type == 'chatglm' else 1.0
+        self.rotary = rotary
 
     def forward(
         self,
@@ -1880,6 +1881,8 @@ class Decoder(torch.nn.Module):
         cross_attention_states: Optional[torch.Tensor] = None,
         cross_attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        if rotary_pos_emb is not None and rotary_pos_emb.shape[0] == 1:
+            rotary_pos_emb = self.rotary(rotary_pos_emb)
         hidden_states = hidden_states.view(1, -1, self.hidden_size)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -2222,7 +2225,7 @@ class LlmExporter(torch.nn.Module):
         self.max_length = 128
         self.stop_ids = []
         self.visual = None
-        self.dst_name = 'llm'
+        self.dst_name = 'block'
         # load config from args
         self.path = args.path
         self.dst_path = args.dst_path
@@ -2230,6 +2233,7 @@ class LlmExporter(torch.nn.Module):
         self.tokenizer_path = args.tokenizer_path
         self.lora_path = args.lora_path
         self.skip_slim = args.skip_slim
+        self.export_split = args.export_split
         self.ppl = args.ppl
         self.awq = args.awq
         self.quant_bit = args.quant_bit
@@ -2351,7 +2355,7 @@ class LlmExporter(torch.nn.Module):
         self.blocks = []
         for block in self.blocks_.children():
             layer_id = len(self.blocks)
-            self.blocks.append(Decoder(block, layer_id, self))
+            self.blocks.append(Decoder(block, layer_id, self, self.rotary))
         self.lm = Lm(self.lm_, self.final_layernorm_, self)
         # visual model
         if self.visual is not None:
@@ -2548,12 +2552,12 @@ class LlmExporter(torch.nn.Module):
         import ctypes
         if hasattr(self, 'word_embeddings'):
             # embedding model's embed
-            tensor_data = self.word_embeddings.weight.data.bfloat16()
+            tensor_data = self.word_embeddings.weight.data.half()
         else:
-            tensor_data = self.embed.embed.weight.data.bfloat16()
+            tensor_data = self.embed.embed.weight.data.half()
         data_ptr = tensor_data.untyped_storage().data_ptr()
         buffer = (ctypes.c_byte * (tensor_data.numel() * 2)).from_address(data_ptr)
-        embedding_file = f'{self.dst_path}/embeddings_bf16.bin'
+        embedding_file = f'{self.dst_path}/embeddings.fp16'
         with open(embedding_file, 'wb') as f:
             f.write(buffer)
         return embedding_file
@@ -2639,6 +2643,50 @@ class LlmExporter(torch.nn.Module):
         model = onnxslim.slim(onnx_model)
         onnx.save(model, onnx_model)
         return onnx_model
+    
+    @spinner_run(f'export split onnx model')
+    def export_onnx_split(self):
+        model = self
+        self.seq_len = 3
+        self.token_len = 0
+        input_ids = torch.arange(3, dtype=torch.long)
+        attention_mask =  self.get_attention_mask()
+        position_ids = self.get_position_ids()
+        onnx_model = f'{self.onnx_path}/{self.dst_name}.onnx'
+        input_ids = self.embedding(input_ids)
+        past_key_values = torch.zeros(self.past_kv_shape[1:])
+
+        # export to onnx
+        for (i, block) in enumerate(model.blocks):
+            onnx_model = f'{self.onnx_path}/{self.dst_name}_{i}.onnx'
+            torch.onnx.export(
+                block, (input_ids, position_ids, attention_mask, past_key_values),
+                onnx_model,
+                input_names=[
+                    'inputs_embeds', 'position_ids', 'attention_mask', 'past_key_values'
+                ],
+                output_names=['hidden_states', 'presents'],
+                dynamic_axes=self.model_dynamic_axes,
+                do_constant_folding=True,
+                verbose=False,
+                opset_version=15)
+            if not self.skip_slim:
+                self.onnx_slim(onnx_model)
+
+        onnx_model = f'{self.onnx_path}/lm.onnx'
+        torch.onnx.export(
+            model.lm, (input_ids),
+            onnx_model,
+            input_names=['hidden_states'],
+            output_names=['logits'],
+            dynamic_axes=self.block_dynamic_axes,
+            do_constant_folding=True,
+            verbose=False,
+            opset_version=15)
+        if not self.skip_slim:
+            self.onnx_slim(onnx_model)
+
+        return ''
 
     @spinner_run(f'export onnx model to ')
     def export_onnx(self):
@@ -2687,6 +2735,11 @@ class LlmExporter(torch.nn.Module):
                 #visual_onnx = self.onnx_slim(visual_onnx)
             if export_mnn:
                 MNNConveter(visual_onnx, None, self).export(quant_bit=self.visual.quant_bit)
+        
+        if self.export_split:
+            self.export_onnx_split()
+            return
+
         # export graph to llm.onnx
         onnx_model = self.export_onnx()
         if not self.skip_slim:
@@ -3041,6 +3094,7 @@ def main():
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
+    parser.add_argument('--export_split', action='store_true', help='Whether or not to export splited onnx model.')
     parser.add_argument('--skip_slim', action='store_true', help='Whether or not to skip onnx-slim.')
     parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
     parser.add_argument('--quant_block', type=int, default=128, help='mnn quant block, default is 0 mean channle-wise.')
